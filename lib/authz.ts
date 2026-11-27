@@ -74,12 +74,36 @@ export async function requireSessionUser(): Promise<AuthzResult<SessionUser>> {
         return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
     }
 
-    const [user] = await sql`
+    let [user] = await sql`
         SELECT uid, role, email, name
         FROM users
         WHERE auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT uid, role, email, name
+                    FROM users
+                    WHERE LOWER(email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing user reconciliation error:', e);
+        }
+    }
 
     if (!user) {
         return {
@@ -112,13 +136,38 @@ export async function requirePatient(): Promise<AuthzResult<PatientIdentity>> {
         return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
     }
 
-    const [user] = await sql`
+    let [user] = await sql`
         SELECT u.uid, u.role, u.email, u.name, p.pid
         FROM users u
         LEFT JOIN patients p ON p.uid = u.uid
         WHERE u.auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT u.uid, u.role, u.email, u.name, p.pid
+                    FROM users u
+                    LEFT JOIN patients p ON p.uid = u.uid
+                    WHERE LOWER(u.email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing patient reconciliation error:', e);
+        }
+    }
 
     if (!user) {
         return {
@@ -134,6 +183,12 @@ export async function requirePatient(): Promise<AuthzResult<PatientIdentity>> {
                 role: user.role,
             }),
         };
+    }
+
+    if (!user.pid) {
+        await sql`INSERT INTO patients (uid) VALUES (${user.uid}) ON CONFLICT DO NOTHING`;
+        const [pRow] = await sql`SELECT pid FROM patients WHERE uid = ${user.uid} LIMIT 1`;
+        if (pRow) user.pid = pRow.pid;
     }
 
     if (!user.pid) {
@@ -201,11 +256,11 @@ export function isJoinableStatus(status: string): boolean {
     return (JOINABLE_STATUSES as readonly string[]).includes(status);
 }
 
-/** Masks a bank account number for display: `1234567890` -> `••••7890`. */
+/** Masks a bank account number for display: `1234567890` -> `â€¢â€¢â€¢â€¢7890`. */
 export function maskAccountNumber(value: string | null | undefined): string | null {
     if (!value) return null;
-    if (value.length <= 4) return '••••';
-    return `••••${value.slice(-4)}`;
+    if (value.length <= 4) return 'â€¢â€¢â€¢â€¢';
+    return `â€¢â€¢â€¢â€¢${value.slice(-4)}`;
 }
 
 /** Minimal appointment projection used by the video-token routes. */
