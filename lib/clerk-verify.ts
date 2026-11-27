@@ -1,4 +1,5 @@
 import { auth, currentUser } from '@clerk/nextjs/server';
+import { createClerkClient, verifyToken } from '@clerk/backend';
 
 export interface ClerkUser {
   id: string;
@@ -27,7 +28,6 @@ export async function verifyClerkUser(): Promise<ClerkUser | null> {
         if (authHeader?.startsWith('Bearer ')) {
           const token = authHeader.slice(7).trim();
           try {
-            const { verifyToken } = await import('@clerk/backend');
             const claims = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
             if (claims?.sub) userId = claims.sub;
           } catch {
@@ -45,6 +45,23 @@ export async function verifyClerkUser(): Promise<ClerkUser | null> {
 
     if (!userId) {
       return null;
+    }
+
+    // Enrich with actual email and name from Clerk Backend API
+    if (process.env.CLERK_SECRET_KEY) {
+      try {
+        const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+        const user = await clerk.users.getUser(userId);
+        return {
+          id: userId,
+          email: user.emailAddresses?.[0]?.emailAddress || null,
+          given_name: user.firstName || null,
+          family_name: user.lastName || null,
+          picture: user.imageUrl || null,
+        };
+      } catch (err: any) {
+        console.warn('[verifyClerkUser] Could not fetch user details from Clerk API:', err?.message || err);
+      }
     }
 
     return {

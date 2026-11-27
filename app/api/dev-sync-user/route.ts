@@ -31,15 +31,55 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Always fetch email and name from Clerk API if missing
+    if (authId && (!email || !fullName) && process.env.CLERK_SECRET_KEY) {
+      try {
+        const { createClerkClient } = await import('@clerk/backend');
+        const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+        const cu = await clerk.users.getUser(authId);
+        if (!email) email = cu?.emailAddresses?.[0]?.emailAddress || '';
+        const nameFromClerk = `${cu?.firstName || ''} ${cu?.lastName || ''}`.trim();
+        if (nameFromClerk && (!fullName || fullName === 'Patient')) fullName = nameFromClerk;
+      } catch (err: any) {
+        console.warn('[dev-sync-user] Could not fetch user from Clerk API:', err?.message || err);
+      }
+    }
+
     if (!authId) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
     if (!fullName) fullName = 'Patient';
 
-    const [existingUser] = await sql`
-      SELECT uid, role FROM users WHERE auth_id = ${authId} LIMIT 1
+    let [existingUser] = await sql`
+      SELECT uid, role, email FROM users WHERE auth_id = ${authId} LIMIT 1
     `;
+
+    // Self-healing: If not found by auth_id, find by email and link auth_id to existing account
+    if (!existingUser && email) {
+      const [existingEmail] = await sql`
+        SELECT uid, role, email FROM users WHERE LOWER(email) = LOWER(${email}) LIMIT 1
+      `;
+
+      if (existingEmail) {
+        if (existingEmail.role !== 'patient') {
+          return NextResponse.json(
+            {
+              error: 'This account is not registered as a patient and cannot use the patient app.',
+              code: 'ROLE_MISMATCH',
+            },
+            { status: 403 }
+          );
+        }
+
+        await sql`
+          UPDATE users
+          SET auth_id = ${authId}, last_login = NOW()
+          WHERE uid = ${existingEmail.uid}
+        `;
+        existingUser = existingEmail;
+      }
+    }
 
     // A doctor who opens the patient app is authenticated but belongs on the other
     // portal. Refuse instead of silently downgrading or re-provisioning them.
@@ -56,53 +96,39 @@ export async function POST(req: NextRequest) {
     let uid = existingUser?.uid;
 
     if (!existingUser) {
-      const [existingEmail] = await sql`
-        SELECT uid, role FROM users WHERE email = ${email} AND auth_id IS DISTINCT FROM ${authId} LIMIT 1
+      // Role is pinned here and cannot be influenced by the caller.
+      const [inserted] = await sql`
+        INSERT INTO users (auth_id, email, name, role, is_verified, last_login)
+        VALUES (
+          ${authId},
+          ${email},
+          ${fullName},
+          'patient',
+          true,
+          NOW()
+        )
+        RETURNING uid
       `;
+      uid = inserted?.uid;
 
-      if (existingEmail) {
-        // Claiming by email must respect the stored role too, otherwise a doctor
-        // account could be swallowed by a patient session on email match.
-        if (existingEmail.role !== 'patient') {
-          return NextResponse.json(
-            {
-              error: 'This account is not registered as a patient and cannot use the patient app.',
-              code: 'ROLE_MISMATCH',
-            },
-            { status: 403 }
-          );
-        }
-
-        await sql`
-          UPDATE users
-          SET auth_id = ${authId}, last_login = ${new Date().toISOString()}
-          WHERE uid = ${existingEmail.uid}
-        `;
-        uid = existingEmail.uid;
-      } else {
-        // Role is pinned here and cannot be influenced by the caller.
-        const [inserted] = await sql`
-          INSERT INTO users (auth_id, email, name, role, is_verified, last_login)
-          VALUES (
-            ${authId},
-            ${email},
-            ${fullName},
-            'patient',
-            true,
-            ${new Date().toISOString()}
-          )
-          RETURNING uid
-        `;
-        uid = inserted?.uid;
-
-        if (uid) {
-          await sql`INSERT INTO patients (uid) VALUES (${uid}) ON CONFLICT DO NOTHING`;
-        }
+      if (uid) {
+        await sql`INSERT INTO patients (uid) VALUES (${uid}) ON CONFLICT DO NOTHING`;
       }
     } else {
+      // Backfill email/name if missing
+      const updateFields: any = { last_login: new Date().toISOString() };
+      if (email && (!existingUser.email || existingUser.email === '')) {
+        updateFields.email = email;
+      }
       await sql`
-        UPDATE users SET last_login = ${new Date().toISOString()} WHERE uid = ${uid}
+        UPDATE users SET 
+          last_login = NOW(),
+          email = COALESCE(NULLIF(users.email, ''), ${email || null})
+        WHERE uid = ${uid}
       `;
+      if (uid) {
+        await sql`INSERT INTO patients (uid) VALUES (${uid}) ON CONFLICT DO NOTHING`;
+      }
     }
 
     const [patientRow] = uid ? await sql`SELECT pid FROM patients WHERE uid = ${uid}` : [];

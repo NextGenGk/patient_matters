@@ -6,7 +6,6 @@ export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest) {
     try {
-        // Use verifyClerkUser to get authenticated user from Clerk
         const clerkUser = await verifyClerkUser();
 
         if (!clerkUser?.id) {
@@ -14,8 +13,11 @@ export async function GET(req: NextRequest) {
         }
 
         // Check if user exists in database by auth_id or email
-        const [existingUser] = await sql`
-            SELECT * FROM users WHERE auth_id = ${clerkUser.id} OR email = ${clerkUser.email || ''} LIMIT 1
+        let [existingUser] = await sql`
+            SELECT * FROM users 
+            WHERE auth_id = ${clerkUser.id} 
+               OR (email IS NOT NULL AND email != '' AND LOWER(email) = LOWER(${clerkUser.email || ''})) 
+            LIMIT 1
         `;
 
         if (existingUser) {
@@ -26,9 +28,6 @@ export async function GET(req: NextRequest) {
                 );
             }
 
-            // Update role to 'patient' since they're logging in through patient_view
-            // Also update auth_id in case they are migrating to the new Clerk project
-            // Sync profile image and name from provider if database value is missing or generic
             const profileImageUrl = existingUser.profile_image_url || existingUser.profileImageUrl || clerkUser.picture || null;
             const currentName = existingUser.name || '';
             const clerkName = `${clerkUser.given_name || ''} ${clerkUser.family_name || ''}`.trim();
@@ -36,13 +35,17 @@ export async function GET(req: NextRequest) {
 
             const [updatedUser] = await sql`
                 UPDATE users
-                SET last_login = ${new Date().toISOString()},
+                SET last_login = NOW(),
                     auth_id = ${clerkUser.id},
+                    email = COALESCE(NULLIF(users.email, ''), ${clerkUser.email || null}),
                     profile_image_url = ${profileImageUrl},
                     name = ${shouldUpdateName && clerkName ? clerkName : currentName}
                 WHERE uid = ${existingUser.uid}
                 RETURNING *
             `;
+
+            // Ensure patient record exists
+            await sql`INSERT INTO patients (uid) VALUES (${existingUser.uid}) ON CONFLICT DO NOTHING`;
 
             return NextResponse.json({ user: updatedUser || existingUser });
         }
@@ -57,10 +60,14 @@ export async function GET(req: NextRequest) {
                 'patient',
                 true,
                 ${clerkUser.picture || null},
-                ${new Date().toISOString()}
+                NOW()
             )
             RETURNING *
         `;
+
+        if (newUser?.uid) {
+            await sql`INSERT INTO patients (uid) VALUES (${newUser.uid}) ON CONFLICT DO NOTHING`;
+        }
 
         return NextResponse.json({ user: newUser, isNew: true });
     } catch (error) {
